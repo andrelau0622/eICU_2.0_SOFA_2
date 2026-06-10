@@ -4,21 +4,6 @@
 
 此脚本通过构建基于 ICU 入室时间的动态时间轴，实现了高时间分辨率的器官功能评估与感染判定。
 
-## 主要功能
-
-* **高精度时间网格构建**：以患者入室为零点，构建从入室前 24 小时（-24h）到出室的逐小时观察窗口。
-* **多系统动态评分**：提取并清洗神经、呼吸、心血管、肝脏、肾脏及凝血系统的临床数据。
-* **24 小时滚动窗口评估**：基于过去 24 小时的最差临床表现动态计算各系统 SOFA 得分。
-* **Sepsis-3 队列识别**：通过联合分析抗生素使用与微生物培养记录，精准定位感染疑似时间 (Suspicion of Infection, SOI)，并计算核心诊断指标 Delta SOFA。
-
----
-
-## 环境与依赖要求
-
-* **数据库系统**：PostgreSQL (建议配置充足的 `work_mem`，脚本默认设置为 `2047MB`)。
-* **底层数据**：已完整导入的 eICU v2.0 数据库，主要依赖 `eicu_icu` 模式 (Schema)。
-* **预处理数据**：依赖部分 `eicu_derived` 模式中的透视表（如 `pivoted_gcs`, `pivoted_bg`, `pivoted_uo`, `pivoted_infusion`, `pivoted_lab` 等）。在运行本脚本前，请确保这些前置派生表已生成。
-
 ---
 
 ## 执行流程说明
@@ -35,26 +20,67 @@
 
 ---
 
-## 核心输出表
+## 核心特性 (Key Features)
 
-运行完毕后，您可以在 `eicu_derived` 模式下获取以下核心结果表供后续分析或建模使用：
+* **高分辨率时序对齐**：基于 `icuintime` 零点偏移（Offset），建立严格的 `-24h` 至出院的每小时时序网格，杜绝未来数据穿越 (Data Leakage)。
+* **24小时滑动窗口 (24h Sliding Window)**：严格遵循 SOFA 评分的“最差值”原则，动态计算过去 24 小时内各器官的极值。
+* **eICU 专属逻辑补丁**：
+* 构建 eICU 专属的 **“可疑感染期 (Suspicion of Infection, SOI)”** 代理变量（融合抗生素与血培养时间戳）。
 
-* **`sofa2_scores`**：包含时间轴延伸至入室前 24 小时的完整逐小时 SOFA 评分详情与总分。
-* **`sofa2_scores_hr_filtered`**：过滤掉入室前数据，仅保留 ICU 期间（hr >= 0）的动态 SOFA 评分。
-* **`first_day_sofa2`**：每位患者入室首日（0-23 小时）的最高 SOFA 总分汇总。
-* **`suspicion_of_infection`**：每位患者基于 eICU 数据的精确感染疑似时间 (SOI) 偏移量。
-* **`sepsis3_sofa2_delta`**：用于 Sepsis-3 诊断判定的关键表，包含感染相关的最大 SOFA 恶化值 (`delta_sofa2`)。
+
+* **AI / ML 友好**：内建基于 `patientunitstayid` 和 `subject_id` 物理哈希的 `fold_id` (0-9) 埋点，确保在交叉验证中同一患者的所有入室记录被严格隔离在同一折内。
 
 ---
 
-## 使用指南
+## 环境依赖 (Prerequisites)
 
-您可以使用 `psql` 命令行工具或任何支持 PostgreSQL 的数据库可视化工具（如 DBeaver, DataGrip）直接执行该脚本：
+1. 已在本地或服务器部署完整的 [eICU-CRD v2.0](https://eicu-crd.mit.edu/) 数据库（PostgreSQL 环境）。
+2. 已完成 eICU 官方的预处理概念表（需包含 `eicu_derived` 模式下的基础透视表，如 `pivoted_gcs`, `pivoted_bg`, `pivoted_lab`, `pivoted_vital` 等）。
+3. 数据库需预留至少 5GB 的空闲存储空间用于生成临时特征全量表。
 
+---
+
+## 架构与计算流程 (Pipeline Architecture)
+
+本脚本 (`eicu_sepsis3_sofa2_extraction.sql`) 采用流水线式架构，分 8 个阶段自动执行：
+
+* **Step 0: 环境清理** - 安全重置并删除旧版缓存表。
+* **Step 1: 时序网格生成** - 构建 `icustay_hourly_basedon_icuintime` 小时级骨架。
+* **Step 2: 独立器官特征提取 (Stage 1)** - 并行提取 6 大系统（神经、呼吸、凝血、肝脏、肾脏、心血管/尿量）及辅助支持（镇静、谵妄、RRT、ECMO、机械通气）的每小时数据。
+* **Step 3: 原始评分计算** - 汇合生成 `sofa2_hourly_raw`。
+* **Step 4: 动态级联评分** - 基于 24h 滑动窗口生成 `sofa2_scores`（附带 ML `fold_id`）。
+* **Step 5 & 6: 截面与过滤** - 生成入室首日评分表 `first_day_sofa2`。
+* **Step 7: SOI 锚定** - 根据抗生素与微生物培养时间差提取可疑感染时间轴 `suspicion_of_infection`。
+* **Step 8: Sepsis-3 最终判定** - 计算 SOI 前后（-48h 到 +24h）的急性器官衰竭激增 `sepsis3_sofa2_delta`。
+
+---
+
+## 核心输出数据字典 (Output Tables)
+
+成功运行脚本后，您的 `eicu_derived` 模式下将生成以下供直接查询/导出的核心表：
+
+| 表名 (Table Name) | 颗粒度 | 描述 (Description) |
+| --- | --- | --- |
+| `sofa2_scores` | 每患者每小时 | 包含 6 大系统详细评分、总分及哈希 `fold_id`。是时序深度学习模型（如 RNN/Transformer）的最佳输入。 |
+| `first_day_sofa2` | 每患者每次入室 | 患者进入 ICU 前 24 小时内的最高 SOFA 总分，适用于常规横断面统计与基线特征对比。 |
+| `suspicion_of_infection` | 每患者每次入室 | Sepsis 判定的核心时间锚点（抗生素与血培养联合判定）。 |
+| `sepsis3_sofa2_delta` | 每患者每小时 | 仅包含发生可疑感染窗口期（-48h ~ +24h）的数据，直接提供 `delta_sofa2` 字段用于 Sepsis-3 （ΔSOFA ≥ 2）阳性标签的极速筛选。 |
+
+---
+
+## 使用指南 (Usage)
+
+1. 下载本仓库中的 SQL 脚本：
 ```bash
-psql -U your_username -d eicu_database -f sofa2_sepsis3_extraction.sql
+git clone https://github.com/YourUsername/eICU-Sepsis3-Pipeline.git
 
 ```
 
-> **注意事项：**
-> 在 **步骤 2** 中，部分系统（凝血、肝脏、肾脏检验指标、谵妄等）使用了占位符形式创建了空表（`WHERE 1=0`）。这是为了保持文件和数据管道的结构完整性。实际的检验指标评估已在 **步骤 3** (`sofa2_hourly_raw`) 中直接通过联表 `pivoted_lab` 进行了处理。如果您需要深入研究这些独立子系统，可以后续自行扩展占位表逻辑。
+
+2. 使用 `psql` 或您的数据库客户端（如 DBeaver, DataGrip）连接至 eICU 数据库。
+3. 确保当前拥有对 `eicu_derived` Schema 的建表与修改权限。
+4. 执行全量脚本（视硬件性能，通常耗时 5-15 分钟）：
+```bash
+psql -U your_username -d eicu -f eicu_sepsis3_sofa2_extraction.sql
+
+```
